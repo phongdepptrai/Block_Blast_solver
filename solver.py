@@ -50,8 +50,11 @@ class BlockBlastSolver:
             return board, 0
 
         # Calculate score (simplified logic: 10 pts per line)
-        # Real game has combos, but this is a good heuristic
-        score = (len(rows_to_clear) + len(cols_to_clear)) * 10
+        # Combo logic: if >1 line, bonus points.
+        num_lines = len(rows_to_clear) + len(cols_to_clear)
+        score = num_lines * 10
+        if num_lines > 1:
+            score += num_lines * 5 # Bonus
 
         # Create new board with lines cleared
         new_board = [row[:] for row in board]
@@ -69,56 +72,59 @@ class BlockBlastSolver:
     def count_cells(self, block):
         return sum(sum(row) for row in block)
 
-    def solve(self, board, blocks):
+    def count_empty_cells(self, board):
+        """Counts the number of empty cells (0s) on the board."""
+        return sum(row.count(0) for row in board)
+
+    def solve(self, board, blocks, strategy="score"):
         """
         Finds the best sequence of moves.
-        Returns: (max_score, list_of_moves)
+        strategies:
+          - "score": Maximize total score.
+          - "survival": Maximize empty space (minimize filled cells) after all moves.
+
+        Returns: list_of_moves
         move = {'block_index': int, 'r': int, 'c': int}
         """
 
-        best_score = -1
-        best_path = []
+        # We need to maximize a "fitness" metric based on strategy
+        # For "score": fitness = current_score
+        # For "survival": fitness = current_score + (empty_cells * huge_weight)
+        # Actually, survival should just prioritize empty cells, but score is a good tiebreaker.
 
-        # block_indices = list(range(len(blocks)))
-        # We need to try all permutations of blocks?
-        # The game allows placing available blocks in any order.
-        # Yes, order matters.
-
-        # State: (current_board, available_block_indices, current_score, path)
-        stack = [(board, list(range(len(blocks))), 0, [])]
-
-        # To avoid infinite loops or too deep recursion, we can just use recursion
-        # But let's stick to a recursive helper for clarity
-
-        self.best_global_score = -1
+        self.best_global_fitness = -1e9
         self.best_global_path = []
+
+        def calculate_fitness(current_score, current_board):
+            if strategy == "score":
+                return current_score
+            elif strategy == "survival":
+                # Primary: Empty cells (more is better). Max empty is 64.
+                # Secondary: Score.
+                empty = self.count_empty_cells(current_board)
+                return empty * 1000 + current_score
+            return current_score
 
         def dfs(current_board, available_indices, current_score, path):
             if not available_indices:
-                if current_score > self.best_global_score:
-                    self.best_global_score = current_score
+                fitness = calculate_fitness(current_score, current_board)
+                if fitness > self.best_global_fitness:
+                    self.best_global_fitness = fitness
                     self.best_global_path = list(path)
                 return
 
-            # Optimization: If we can't beat the best score even with perfect clears?
-            # Hard to estimate.
-
-            # Optimization: Try to find ANY valid move first.
-            can_move = False
+            valid_move_found = False
 
             for i in available_indices:
                 block = blocks[i]
 
-                # Try all positions
-                # Heuristic: Optimization?
-                # For now, brute force.
-
-                valid_placement_found_for_this_block = False
+                # Heuristic optimization: If survival mode, maybe prioritize clearing lines immediately?
+                # The DFS does exhaust search so it will find it.
 
                 for r in range(self.rows - len(block) + 1):
                     for c in range(self.cols - len(block[0]) + 1):
                         if self.can_place(current_board, block, r, c):
-                            valid_placement_found_for_this_block = True
+                            valid_move_found = True
 
                             # Execute move
                             temp_board = self.place_block(current_board, block, r, c)
@@ -134,11 +140,14 @@ class BlockBlastSolver:
 
                             dfs(next_board, remaining_indices, new_score, path + [{'block_idx': i, 'r': r, 'c': c, 'score_gain': placement_points + line_points}])
 
-            # If no move was possible for ANY remaining block, the game ends (or partial solution)
-            # We should record this score
-            if current_score > self.best_global_score:
-                self.best_global_score = current_score
-                self.best_global_path = list(path)
+            # If we couldn't place this block, it's a dead end for this path (Game Over equivalent)
+            # However, in "survival" mode, maybe we placed 2 blocks and the 3rd failed.
+            # We should still record the result of the 2 blocks if it's better than nothing.
+            if not valid_move_found or (available_indices and not valid_move_found):
+                fitness = calculate_fitness(current_score, current_board)
+                if fitness > self.best_global_fitness:
+                    self.best_global_fitness = fitness
+                    self.best_global_path = list(path)
 
         dfs(board, list(range(len(blocks))), 0, [])
 
@@ -151,16 +160,18 @@ def format_solution(moves):
     return result
 
 if __name__ == "__main__":
-    # Test with dummy data
     s = BlockBlastSolver()
     board = [[0]*8 for _ in range(8)]
-    # Create a near-full row for testing
-    for c in range(7): board[7][c] = 1
+    # Create a situation where clearing a line is possible but maybe not optimal for survival?
+    # Hard to construct simple case, but let's test basic functionality
 
     blocks = [
-        [[1]], # 1x1
-        [[1, 1]] # 1x2
+        [[1]],
+        [[1, 1]]
     ]
 
-    path = s.solve(board, blocks)
-    print(path)
+    path = s.solve(board, blocks, strategy="score")
+    print("Score Strategy Path:", path)
+
+    path_survival = s.solve(board, blocks, strategy="survival")
+    print("Survival Strategy Path:", path_survival)
