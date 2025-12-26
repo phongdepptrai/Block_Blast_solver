@@ -4,6 +4,7 @@ import cv2
 from PIL import Image
 import analyze_image
 import solver
+import hashlib
 
 # Set page config for better mobile experience
 st.set_page_config(
@@ -101,6 +102,33 @@ def draw_block_preview(block, cell_size=30):
                             (255, 165, 0), -1) # Orange color for block
     return img
 
+def pad_block_to_5x5(block):
+    """Pads a block matrix to 5x5 for easier editing in the UI."""
+    target_size = 5
+    h = len(block)
+    w = len(block[0])
+
+    padded = np.zeros((target_size, target_size), dtype=int)
+
+    for r in range(min(h, target_size)):
+        for c in range(min(w, target_size)):
+            padded[r][c] = block[r][c]
+
+    return padded.tolist()
+
+def trim_block(block):
+    """Trims empty rows and cols from a block matrix."""
+    arr = np.array(block)
+    if not np.any(arr):
+        return [[0]] # Minimal empty block
+
+    rows = np.any(arr, axis=1)
+    cols = np.any(arr, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+
+    return arr[rmin:rmax+1, cmin:cmax+1].tolist()
+
 # Initialize session state
 if 'step_index' not in st.session_state:
     st.session_state.step_index = 0
@@ -116,22 +144,56 @@ if 'board_grid' not in st.session_state:
     st.session_state.board_grid = None
 if 'analysis_done' not in st.session_state:
     st.session_state.analysis_done = False
+if 'current_file_hash' not in st.session_state:
+    st.session_state.current_file_hash = None
 
 st.title("🧩 Block Blast Solver")
 
-# File Uploader
-uploaded_file = st.file_uploader("Upload Screenshot", type=["png", "jpg", "jpeg"])
+# --- Sidebar ---
+with st.sidebar:
+    st.header("⚙️ Settings")
+    instant_solve = st.checkbox("⚡ Instant Solve Mode", value=False, help="Skip manual verification and solve immediately after upload.")
+
+    st.divider()
+    st.markdown("### 💡 Tips")
+    st.markdown("- **Paste Image:** Click 'Browse files' then press `Ctrl+V` (on PC).")
+    st.markdown("- **Mobile:** Use camera to capture the screen.")
+
+# --- File Uploader ---
+uploaded_file = st.file_uploader("Upload Screenshot", type=["png", "jpg", "jpeg"], help="You can paste images here!")
+
+def perform_analysis(img):
+    board, blocks, board_info = analyze_image.get_game_state(image_array=img)
+    return board, blocks, board_info
+
+def perform_solve(board, blocks, strategy):
+    s = solver.BlockBlastSolver()
+    strat = "score" if strategy == "Maximize Score" else "survival"
+    return s.solve(board, blocks, strategy=strat)
 
 if uploaded_file is not None:
     # Convert uploaded file to opencv image
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     original_img = cv2.imdecode(file_bytes, 1)
 
-    # Store processed image if not already (or if new upload logic is needed, but for now we assume one upload)
-    # To properly handle new uploads, we should check file ID or similar, but simplified here:
-    st.session_state.processed_image = original_img
+    # Calculate hash to detect file change
+    file_hash = hashlib.md5(file_bytes).hexdigest()
 
-    # Layout
+    if st.session_state.current_file_hash != file_hash:
+        # New file detected! Reset state
+        st.session_state.current_file_hash = file_hash
+        st.session_state.processed_image = original_img
+        st.session_state.analysis_done = False
+        st.session_state.solution = None
+        st.session_state.board_grid = None
+        st.session_state.blocks = None
+        st.session_state.step_index = 0
+
+        # If we have a widget key state for editors, we might need to handle that,
+        # but Streamlit usually resets widgets on rerun if key is dynamic or not in session state explicitly.
+        # Rerun to clear old UI components
+        st.rerun()
+
     col_img, col_actions = st.columns([1, 1])
 
     with col_img:
@@ -149,10 +211,14 @@ if uploaded_file is not None:
             index=0
         )
 
-        if st.button("🔍 Analyze Image", type="primary"):
+        # Determine if we should auto-analyze/solve
+        # Check if analysis is NOT done yet.
+        should_run_instant = instant_solve and not st.session_state.analysis_done
+
+        if st.button("🔍 Analyze Image", type="primary") or should_run_instant:
             with st.spinner("Analyzing board..."):
                 try:
-                    board, blocks, board_info = analyze_image.get_game_state(image_array=original_img)
+                    board, blocks, board_info = perform_analysis(original_img)
 
                     if board is None:
                         st.error("❌ Could not detect board.")
@@ -162,58 +228,97 @@ if uploaded_file is not None:
                         st.session_state.board_grid = board
                         st.session_state.analysis_done = True
                         st.session_state.solution = None # Reset solution
-                        st.rerun() # Force rerun to show editor
+
+                        if instant_solve:
+                            # Immediate solve
+                             with st.spinner("Solving instantly..."):
+                                sol = perform_solve(board, blocks, strategy)
+                                st.session_state.solution = sol if sol else []
+                                if not sol:
+                                    st.warning("⚠️ No valid moves found.")
+                                else:
+                                    st.success("✅ Solution Found!")
+                                st.rerun()
+                        else:
+                            st.rerun() # Go to edit mode
 
                 except Exception as e:
                     st.error(f"Error: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     # --- Manual Edit Step ---
-    if st.session_state.analysis_done and st.session_state.board_grid is not None:
-        st.divider()
-        st.subheader("🛠️ Verify & Edit Board State")
-        st.info("The AI might make mistakes. Please correct the board grid below if needed.")
+    if st.session_state.analysis_done:
+        expander_title = "🛠️ Verify & Edit Board State"
+        expanded_default = True
 
-        # Board Editor
-        edited_board = st.data_editor(
-            st.session_state.board_grid,
-            column_config={
-                f"{i}": st.column_config.CheckboxColumn(
-                    f"C{i}",
-                    width="small",
-                    default=False,
+        # Collapse if instant solve worked
+        if instant_solve and st.session_state.solution is not None:
+            expanded_default = False
+
+        with st.expander(expander_title, expanded=expanded_default):
+            st.info("Correct the board or blocks below if detection failed.")
+
+            # Board Editor
+            col_board, col_blocks = st.columns([1, 1])
+
+            with col_board:
+                st.markdown("#### Board Grid")
+                edited_board = st.data_editor(
+                    st.session_state.board_grid,
+                    column_config={
+                        f"{i}": st.column_config.CheckboxColumn(
+                            f"C{i}", width="small", default=False
+                        ) for i in range(8)
+                    },
+                    hide_index=True,
+                    use_container_width=False,
+                    key="board_editor"
                 )
-                for i in range(8)
-            },
-            hide_index=True,
-            use_container_width=False # Keep it square-ish
-        )
 
-        # Block Display (Simple read-only for now, editing 3D arrays in streamlit is hard)
-        st.caption(f"Detected {len(st.session_state.blocks)} blocks ready to solve.")
+            with col_blocks:
+                st.markdown("#### Detected Blocks")
+                new_blocks = []
+                for idx, blk in enumerate(st.session_state.blocks):
+                    st.caption(f"Block {idx}")
 
-        if st.button("🚀 Confirm & Solve", type="primary"):
-             # Update board with edited version
-            # edited_board is a list of lists (or whatever data_editor returns, usually matching input type)
-            # data_editor returns a dataframe if input is dataframe, or list of dicts?
-            # If input is list of lists, it returns list of lists?
-            # Streamlit docs say: "If the input data is a list of lists... returns the edited data in the same format."
+                    # Pad to 5x5 for editing
+                    padded = pad_block_to_5x5(blk)
 
-            # Need to ensure type consistency (ints)
-            final_board = [[int(cell) for cell in row] for row in edited_board]
+                    # Ensure key is unique per block AND per file upload session (implicit by rerun reset?)
+                    # If we reload, keys might conflict if we don't reset.
+                    # But since we rerun on new file, it should be fine.
+                    edited_blk = st.data_editor(
+                        padded,
+                        column_config={
+                             f"{i}": st.column_config.CheckboxColumn(width="small", default=False)
+                             for i in range(5)
+                        },
+                        hide_index=True,
+                        key=f"block_editor_{idx}",
+                        height=150
+                    )
 
-            with st.spinner("Solving..."):
-                solver_strategy = "score" if strategy == "Maximize Score" else "survival"
-                s = solver.BlockBlastSolver()
-                solution = s.solve(final_board, st.session_state.blocks, strategy=solver_strategy)
+                    # Trim back
+                    trimmed = trim_block(edited_blk)
+                    new_blocks.append(trimmed)
 
-                if not solution:
-                    st.warning("⚠️ No valid moves found.")
-                    st.session_state.solution = []
-                else:
-                    st.session_state.solution = solution
-                    st.session_state.step_index = 0
-                    st.success("✅ Solution Found!")
-                    st.rerun()
+            if st.button("🚀 Confirm & Re-Solve", type="primary"):
+                # Update state
+                final_board = [[int(cell) for cell in row] for row in edited_board]
+                st.session_state.board_grid = final_board
+                st.session_state.blocks = new_blocks
+
+                with st.spinner("Solving..."):
+                    sol = perform_solve(final_board, new_blocks, strategy)
+                    st.session_state.solution = sol if sol else []
+
+                    if not sol:
+                        st.warning("⚠️ No valid moves found.")
+                    else:
+                        st.session_state.step_index = 0
+                        st.success("✅ Solution Found!")
+                        st.rerun()
 
     # --- Solution Navigation ---
     if st.session_state.solution:
@@ -224,7 +329,7 @@ if uploaded_file is not None:
         total_steps = len(solution)
 
         if total_steps == 0:
-            st.write("No moves available.")
+            st.warning("No moves available.")
         else:
             # Navigation Controls
             c1, c2, c3 = st.columns([1, 2, 1])
@@ -240,6 +345,9 @@ if uploaded_file is not None:
                     st.session_state.step_index += 1
 
             # Display Current Step
+            if st.session_state.step_index >= len(solution):
+                st.session_state.step_index = 0
+
             current_step = solution[st.session_state.step_index]
             block_idx = current_step['block_idx']
             r, c = current_step['r'], current_step['c']
@@ -252,13 +360,11 @@ if uploaded_file is not None:
                 st.info(f"**Action:** Place **Block {block_idx}** at (Row {r}, Col {c})")
                 st.metric("Score Gain", score)
 
-                # Show Block Preview
                 current_block = st.session_state.blocks[block_idx]
                 block_preview_img = draw_block_preview(current_block)
                 st.image(block_preview_img, caption=f"Block {block_idx}", width=150)
 
             with step_col2:
-                # Generate Visualization
                 viz_img = draw_solution_step(
                     st.session_state.processed_image,
                     st.session_state.board_info,
